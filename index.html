@@ -31,7 +31,7 @@
 </head>
 <body>
   <main class="app">
-    <header><div><h1>◎ 모기 퇴치</h1><small>움직이는 작은 물체 찾기 · v0.2</small></div><div class="tag" id="mode">실험용 시제품</div></header>
+    <header><div><h1>◎ 모기 퇴치</h1><small>움직이는 작은 물체 찾기 · v0.3</small></div><div class="tag" id="mode">실험용 시제품</div></header>
     <section class="view" id="viewport" aria-label="실시간 카메라 영상">
       <video id="camera" autoplay muted playsinline></video>
       <canvas class="overlay" id="overlay"></canvas>
@@ -42,220 +42,237 @@
     <section class="controls">
       <div class="action"><button class="btn main" id="start">📷 탐색 시작</button><button class="btn stop" id="stop" disabled>종료</button><button class="btn" id="clear" aria-label="추적 초기화">↺</button></div>
       <div class="opts">
-        <label>감도<select id="sensitivity"><option value="82" selected>낮음 (오탐↓)</option><option value="60">보통</option><option value="45">높음 (오탐↑)</option></select></label>
-        <label>분석 화질<select id="resolution"><option value="540">빠름</option><option value="720" selected>표준</option><option value="960">정밀 (발열↑)</option></select></label>
+        <label>감도<select id="sensitivity"><option value="64" selected>낮음 (오탐↓)</option><option value="47">보통</option><option value="34">높음 (오탐↑)</option></select></label>
+        <label>분석 화질<select id="resolution"><option value="480">빠름</option><option value="640" selected>표준 (추천)</option><option value="960">정밀 (느림·발열↑)</option></select></label>
         <label><input id="vibrate" type="checkbox" checked> 감지 시 진동</label>
       </div>
       <div class="stats"><div class="stat"><span>분석 속도</span><b id="fps">0 fps</b></div><div class="stat"><span>분석 해상도</span><b id="res">-</b></div><div class="stat"><span>현재 추적</span><b id="tracks">0개</b></div></div>
       <div id="error" role="alert"></div>
-      <p class="note"><strong>중요:</strong> 이 버전은 AI 모기 식별기가 아닙니다. 배경보다 독립적으로 움직인 작은 점을 표시하며, 먼지·그림자 등 오탐이 남을 수 있습니다. 브라우저의 HTTPS 주소에서 실행하세요. 영상은 서버로 전송하거나 저장하지 않습니다.</p>
+      <p class="note"><strong>중요:</strong> v0.3은 AI 모기 식별기가 아닙니다. 카메라 이동을 보정하고 작은 움직임 후보만 표시합니다. TV·빛·먼지·천은 오탐일 수 있고, 작은 모기를 놓칠 수도 있습니다. 영상은 서버로 전송하거나 저장하지 않습니다.</p>
     </section>
   </main>
 <script>
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const video=$('camera'), overlay=$('overlay'), viewport=$('viewport'), ctx=overlay.getContext('2d');
-  const work=document.createElement('canvas'), wctx=work.getContext('2d',{willReadFrequently:true});
-  let stream=null,running=false,processing=false,lastAnalysis=0,prev=null,prevCoarse=null,tracks=[],seq=0;
-  let frameCount=0,fpsStart=0,lastBuzz=0,width=720,height=1280,coarseW=0,coarseH=0;
-  let cameraX=0,cameraY=0,flags=null,seen=null,queue=null;
-  const msg = s => $('message').textContent=s;
-  const reset = () => {
-    prev=null;prevCoarse=null;tracks=[];seq=0;cameraX=0;cameraY=0;frameCount=0;
-    lastAnalysis=0;fpsStart=performance.now();$('count').textContent='0';$('tracks').textContent='0개';
-  };
+  const video = $('camera'), overlay = $('overlay'), viewport = $('viewport');
+  const ctx = overlay.getContext('2d');
+  const work = document.createElement('canvas'), wctx = work.getContext('2d', {willReadFrequently: true});
+  let stream=null, running=false, lastAnalysis=0, lastBuzz=0, prev=null, prevSmall=null, tracks=[], sequence=0;
+  let width=640,height=960,smallW=0,smallH=0, gridW=0,gridH=0, flags,seen,queue;
+  let worldX=0,worldY=0, lastGood=0, samples=0, fpsStart=0, cameraWarning=false;
+  let failed=0, eventText='', currentCandidates=0, lastUpdate=0;
+  const STEP=2, SMALL=8;
+  const msg = s => {if(eventText!==s){eventText=s;$('message').textContent=s;}};
+  function reset(){ prev=null;prevSmall=null;tracks=[];sequence=0;worldX=0;worldY=0;failed=0;lastAnalysis=0;lastGood=0;samples=0;fpsStart=performance.now();
+    $('count').textContent='0';$('tracks').textContent='0개';$('fps').textContent='0 fps';}
   function configure(){
-    width=Number($('resolution').value);
-    height=Math.max(1,Math.round(width*(video.videoHeight||720)/(video.videoWidth||1280)));
-    work.width=width;work.height=height;coarseW=Math.ceil(width/5);coarseH=Math.ceil(height/5);
-    flags=new Uint8Array(width*height);seen=new Uint8Array(width*height);queue=new Int32Array(width*height);
-    reset();$('res').textContent=width+'×'+height;
+    width=Number($('resolution').value);height=Math.max(1,Math.round(width*video.videoHeight/video.videoWidth));
+    work.width=width;work.height=height;
+    smallW=Math.ceil(width/SMALL);smallH=Math.ceil(height/SMALL);
+    gridW=Math.ceil(width/STEP);gridH=Math.ceil(height/STEP);
+    flags=new Uint8Array(gridW*gridH);seen=new Uint8Array(gridW*gridH);queue=new Int32Array(gridW*gridH);
+    $('res').textContent=width+'×'+height;reset();
   }
-  function resizeOverlay(){const r=viewport.getBoundingClientRect(),d=Math.min(window.devicePixelRatio||1,2);overlay.width=Math.round(r.width*d);overlay.height=Math.round(r.height*d);}
-  function grayAndCoarse(rgba){
-    const gray=new Uint8Array(width*height),cw=coarseW,ch=coarseH,coarse=new Uint8Array(cw*ch);
-    for(let p=0,i=0;i<gray.length;i++,p+=4)gray[i]=(rgba[p]*77+rgba[p+1]*150+rgba[p+2]*29)>>8;
-    for(let y=0;y<ch;y++){const sy=Math.min(height-1,y*5+2);for(let x=0;x<cw;x++)coarse[y*cw+x]=gray[sy*width+Math.min(width-1,x*5+2)];}
-    return {gray,coarse};
-  }
-  // 연속 프레임 전체 배경의 평행 이동을 추정합니다. 수색 중 손 움직임을 보정하기 위한 첫 단계입니다.
-  function estimateShift(oldFrame,newFrame){
-    let best={dx:0,dy:0,score:Infinity},cw=coarseW,ch=coarseH;
-    for(let dy=-9;dy<=9;dy++)for(let dx=-9;dx<=9;dx++){
-      let total=0,n=0;
-      for(let y=11;y<ch-11;y+=8){const yy=y+dy;
-        for(let x=11;x<cw-11;x+=8){const xx=x+dx;total+=Math.abs(oldFrame[y*cw+x]-newFrame[yy*cw+xx]);n++;}
-      }
-      if(n&&total/n<best.score)best={dx,dy,score:total/n};
+  function resizeOverlay(){ const rect=viewport.getBoundingClientRect(),scale=Math.min(window.devicePixelRatio||1,2);
+    overlay.width=Math.max(1,Math.round(rect.width*scale));overlay.height=Math.max(1,Math.round(rect.height*scale));}
+  function imageInfo(data){
+    const gray=new Uint8Array(width*height),small=new Uint8Array(smallW*smallH);
+    for(let k=0,p=0;k<gray.length;k++,p+=4)gray[k]=(data[p]*77+data[p+1]*150+data[p+2]*29)>>8;
+    for(let y=0;y<smallH;y++){
+      const yy=Math.min(height-1,y*SMALL+4),row=yy*width;
+      for(let x=0;x<smallW;x++)small[y*smallW+x]=gray[row+Math.min(width-1,x*SMALL+4)];
     }
-    return best;
+    return {gray,small};
   }
-  function refineShift(oldFrame,newFrame,bx,by){
-    let best={dx:bx,dy:by,score:Infinity};
-    for(let dy=by-2;dy<=by+2;dy++)for(let dx=bx-2;dx<=bx+2;dx++){
-      let err=0,n=0;
-      for(let y=20;y<height-20;y+=11){const py=y-dy;if(py<=1||py>=height-1)continue;
-        for(let x=20;x<width-20;x+=11){const px=x-dx;if(px<=1||px>=width-1)continue;
-          const j=py*width+px,i=y*width+x;
-          // 충분한 질감이 있는 배경을 정렬 기준으로 사용합니다.
-          if(Math.abs(oldFrame[j]-oldFrame[j+1])+Math.abs(oldFrame[j]-oldFrame[j+width])<10)continue;
-          err+=Math.min(100,Math.abs(newFrame[i]-oldFrame[j]));n++;
+  // Coarse-to-fine translation compensation. The coarse search covers ~120 px in all directions.
+  function estimateShift(oldS,newS,oldF,newF){
+    let dx0=0,dy0=0,best=Infinity,quality=0;
+    const maxX=Math.min(12,Math.max(0,((smallW-20)/2)|0));
+    const maxY=Math.min(12,Math.max(0,((smallH-20)/2)|0));
+    for(let dy=-maxY;dy<=maxY;dy++)for(let dx=-maxX;dx<=maxX;dx++){
+      let cost=0,n=0;
+      for(let y=maxY+2;y<smallH-maxY-2;y+=7){const r=y*smallW,rr=(y+dy)*smallW;
+        for(let x=maxX+2;x<smallW-maxX-2;x+=7){
+          const k=r+x;
+          // Use textured pixels for scene matching; uniform regions have little information.
+          const d=Math.abs(oldS[k]-newS[rr+x+dx]);cost+=Math.min(d,50);n++;
         }
       }
-      if(n>=25&&err/n<best.score)best={dx,dy,score:err/n};
+      if(n>=12){const score=cost/n+(dx*dx+dy*dy)*.012;if(score<best){best=score;dx0=dx*SMALL;dy0=dy*SMALL;quality=n;}}
     }
-    return best;
+    if(!Number.isFinite(best))return {dx:0,dy:0,score:99,valid:false};
+    // Fine search with sparse sampling to avoid heavy full-image matching.
+    let bx=dx0,by=dy0,refined=Infinity;
+    for(let dy=dy0-4;dy<=dy0+4;dy+=2)for(let dx=dx0-4;dx<=dx0+4;dx+=2){
+      let cost=0,n=0;
+      for(let y=22+Math.max(0,dy);y<height-22+Math.min(0,dy);y+=19){const oldY=y-dy;
+        for(let x=22+Math.max(0,dx);x<width-22+Math.min(0,dx);x+=19){const oldX=x-dx,j=oldY*width+oldX,k=y*width+x;
+          const edge=Math.abs(oldF[j]-oldF[j+1])+Math.abs(oldF[j]-oldF[j+width]);
+          if(edge<12)continue;
+          cost+=Math.min(50,Math.abs(oldF[j]-newF[k]));n++;
+        }
+      }
+      if(n>=30&&cost/n<refined){refined=cost/n;bx=dx;by=dy;}
+    }
+    const nearEdge=Math.abs(dx0)>=maxX*SMALL||Math.abs(dy0)>=maxY*SMALL;
+    const score=Number.isFinite(refined)?refined:best;
+    return {dx:bx,dy:by,score,valid:!nearEdge && score<32 && best<34};
   }
-  function findBlobs(current,old,dx,dy,threshold){
-    flags.fill(0);seen.fill(0);let active=0;
-    const y0=Math.max(3,dy+3),y1=Math.min(height-3,height+dy-3);
-    const x0=Math.max(3,dx+3),x1=Math.min(width-3,width+dx-3);
-    // 배경 양쪽 프레임에 모두 강한 윤곽선이 있다면 카메라 흔들림에서 생긴 잔상일 가능성이 큽니다.
-    for(let y=y0;y<y1;y++){
-      const row=y*width,pr=(y-dy)*width;
-      for(let x=x0;x<x1;x++){
-        const i=row+x,j=pr+x-dx,diff=Math.abs(current[i]-old[j]);
-        if(diff<=threshold)continue;
-        const oldGrad=Math.abs(old[j-1]-old[j+1])+Math.abs(old[j-width]-old[j+width]);
-        const newGrad=Math.abs(current[i-1]-current[i+1])+Math.abs(current[i-width]-current[i+width]);
-        if(oldGrad>75&&newGrad>75)continue;
-        flags[i]=1;active++;
+  function findCandidates(now,old,dx,dy,threshold){
+    flags.fill(0);seen.fill(0);
+    let active=0,spans=[]; const endX=Math.max(1,Math.ceil(Math.abs(dx)/STEP)+3),endY=Math.max(1,Math.ceil(Math.abs(dy)/STEP)+3);
+    for(let gy=endY;gy<gridH-endY;gy++){
+      const y=gy*STEP,py=y-dy;
+      if(py<3||py>=height-3)continue;
+      for(let gx=endX;gx<gridW-endX;gx++){
+        const x=gx*STEP,px=x-dx;if(px<3||px>=width-3)continue;
+        const k=y*width+x,j=py*width+px,delta=Math.abs(now[k]-old[j]);
+        if(delta<threshold)continue;
+        const oldEdge=Math.abs(old[j-2]-old[j+2])+Math.abs(old[j-width*2]-old[j+width*2]);
+        const newEdge=Math.abs(now[k-2]-now[k+2])+Math.abs(now[k-width*2]-now[k+width*2]);
+        if(oldEdge>105&&newEdge>105)continue;
+        flags[gy*gridW+gx]=1;active++;
       }
     }
-    if(active>width*height*.022)return {result:[],noise:true};
-    const result=[];
-    for(let y=4;y<height-4;y++)for(let x=4;x<width-4;x++){
-      const start=y*width+x;if(!flags[start]||seen[start])continue;
-      let head=0,tail=1,minx=x,maxx=x,miny=y,maxy=y,amount=0,sx=0,sy=0;
-      queue[0]=start;seen[start]=1;
+    if(active>gridW*gridH*.025)return {list:[], noisy:true};
+    const tiny=[],large=[];
+    for(let gy=3;gy<gridH-3;gy++)for(let gx=3;gx<gridW-3;gx++){
+      const pos=gy*gridW+gx;if(!flags[pos]||seen[pos])continue;
+      let head=0,tail=1,area=0,minx=gx,maxx=gx,miny=gy,maxy=gy,sx=0,sy=0;
+      seen[pos]=1;queue[0]=pos;
       while(head<tail){
-        const p=queue[head++],py=(p/width)|0,px=p-py*width;
-        amount++;sx+=px;sy+=py;
-        if(px<minx)minx=px;if(px>maxx)maxx=px;if(py<miny)miny=py;if(py>maxy)maxy=py;
-        for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
-          if(!ox&&!oy)continue;
-          const nx=px+ox,ny=py+oy;if(nx<2||ny<2||nx>=width-2||ny>=height-2)continue;
-          const q=ny*width+nx;
-          if(flags[q]&&!seen[q]){seen[q]=1;queue[tail++]=q;}
+        const p=queue[head++],y=(p/gridW)|0,x=p-y*gridW;
+        area++;sx+=x;sy+=y;
+        if(x<minx)minx=x;if(x>maxx)maxx=x;if(y<miny)miny=y;if(y>maxy)maxy=y;
+        for(let yy=Math.max(2,y-1);yy<=Math.min(gridH-3,y+1);yy++)for(let xx=Math.max(2,x-1);xx<=Math.min(gridW-3,x+1);xx++){
+          const q=yy*gridW+xx;if(flags[q]&&!seen[q]){seen[q]=1;queue[tail++]=q;}
         }
       }
       const bw=maxx-minx+1,bh=maxy-miny+1,aspect=Math.max(bw,bh)/Math.max(1,Math.min(bw,bh));
-      if(amount>=3&&amount<=110&&bw<=20&&bh<=20&&aspect<=4.5){
-        result.push({x:sx/amount,y:sy/amount,size:Math.max(bw,bh),area:amount});
-        if(result.length>=120)break;
-      }
+      const obj={x:sx/area*STEP,y:sy/area*STEP,size:Math.max(bw,bh)*STEP,area,bounds:[minx*STEP,miny*STEP,maxx*STEP,maxy*STEP]};
+      if(area>=32 || bw>=13 || bh>=13)large.push(obj);
+      else if(area>=2&&area<=31&&bw<=12&&bh<=12&&aspect<=4)tiny.push(obj);
     }
-    return {result,noise:false};
+    // Suppress tiny fragments very close to a moving cloth / another large moving object.
+    const list=tiny.filter(b=>!large.some(big=>b.x>=big.bounds[0]-18&&b.x<=big.bounds[2]+18&&b.y>=big.bounds[1]-18&&b.y<=big.bounds[3]+18));
+    return {list:list.slice(0,80),noisy:false};
   }
-  // 카메라 이동량을 누적해 각 후보를 방 안의 배경 기준 좌표로 변환합니다.
-  // 벽/옷걸이 무늬처럼 카메라와 함께 움직이는 잔상은 같은 배경 좌표에 머무르므로 경고에서 제외됩니다.
-  function linkTracks(blobs,t){
-    const used=new Set();
+  function linkTracks(list,now){
+    const taken=new Set();
+    // Match the stronger existing tracks first, to avoid duplicate IDs at a single target.
+    tracks.sort((a,b)=>b.hits-a.hits);
     for(const tr of tracks){
-      let chosen=-1,minDist=Infinity;
-      for(let i=0;i<blobs.length;i++){
-        if(used.has(i))continue;
-        const b=blobs[i],wx=b.x-cameraX,wy=b.y-cameraY;
-        const dist=Math.hypot(wx-tr.wx,wy-tr.wy);
-        if(dist<Math.max(22,width*.055)&&dist<minDist){minDist=dist;chosen=i;}
+      const dt=Math.max(1,now-tr.time)/1000;
+      const predX=tr.wx+Math.max(-35,Math.min(35,tr.vx*dt));
+      const predY=tr.wy+Math.max(-35,Math.min(35,tr.vy*dt));
+      let choice=-1,d=Infinity;
+      for(let i=0;i<list.length;i++){
+        if(taken.has(i))continue;
+        const b=list[i],wx=b.x-worldX,wy=b.y-worldY,dist=Math.hypot(wx-predX,wy-predY);
+        if(dist<Math.min(35,Math.max(17,width*.038))&&dist<d){d=dist;choice=i;}
       }
-      if(chosen<0)continue;
-      const b=blobs[chosen],wx=b.x-cameraX,wy=b.y-cameraY;
-      const step=Math.hypot(wx-tr.wx,wy-tr.wy);
-      tr.movement+=step;tr.wx=wx;tr.wy=wy;tr.x=b.x;tr.y=b.y;tr.size=b.size;
-      tr.hits++;tr.last=t;
-      tr.path.push({wx,wy});if(tr.path.length>12)tr.path.shift();
-      used.add(chosen);
+      if(choice<0)continue;
+      const b=list[choice],wx=b.x-worldX,wy=b.y-worldY;
+      const delta=Math.hypot(wx-tr.wx,wy-tr.wy);
+      tr.total+=delta;tr.vx=(wx-tr.wx)/dt*.5+tr.vx*.5;tr.vy=(wy-tr.wy)/dt*.5+tr.vy*.5;
+      tr.wx=wx;tr.wy=wy;tr.x=b.x;tr.y=b.y;tr.size=b.size;
+      tr.hits++;tr.time=now;tr.missed=0;
+      tr.path.push({wx,wy});if(tr.path.length>10)tr.path.shift();taken.add(choice);
     }
-    for(let i=0;i<blobs.length;i++){
-      if(used.has(i))continue;
-      const b=blobs[i],wx=b.x-cameraX,wy=b.y-cameraY;
-      tracks.push({id:++seq,x:b.x,y:b.y,wx,wy,size:b.size,hits:1,movement:0,last:t,path:[{wx,wy}]});
+    for(let i=0;i<list.length;i++){
+      if(taken.has(i))continue;
+      const b=list[i],wx=b.x-worldX,wy=b.y-worldY;
+      if(tracks.some(p=>Math.hypot(p.wx-wx,p.wy-wy)<12))continue;
+      tracks.push({x:b.x,y:b.y,wx,wy,size:b.size,hits:1,total:0,vx:0,vy:0,time:now,path:[{wx,wy}]});
     }
-    tracks=tracks.filter(tr=>t-tr.last<650).sort((a,b)=>b.hits-a.hits).slice(0,50);
-    const confirmed=[];for(const tr of tracks.filter(tr=>tr.hits>=4&&tr.movement>=12&&t-tr.last<350)){if(confirmed.every(p=>Math.hypot(p.x-tr.x,p.y-tr.y)>18))confirmed.push(tr);if(confirmed.length>=4)break;}
-    const tentative=tracks.filter(tr=>tr.hits>=3&&tr.movement>=7&&t-tr.last<350);
-    $('count').textContent=String(confirmed.length);$('tracks').textContent=tentative.length+'개';
-    if(confirmed.length&&$('vibrate').checked&&t-lastBuzz>2800){navigator.vibrate?.(50);lastBuzz=t;}
-    return {confirmed:confirmed.length,tentative:tentative.length};
+    // A stale track cannot count as a current detection. Expire rapidly to avoid dozens of ghosts.
+    tracks=tracks.filter(p=>now-p.time<340).slice(0,25);
+    const confirmed=[];const maybe=[];
+    for(const p of tracks){
+      if(now-p.time>190)continue;
+      if(p.hits>=4&&p.total>=10){
+        if(confirmed.every(q=>Math.hypot(q.x-p.x,q.y-p.y)>25))confirmed.push(p);
+      }else if(p.hits>=2&&p.total>=4)maybe.push(p);
+    }
+    confirmed.length=Math.min(confirmed.length,5);
+    $('count').textContent=String(confirmed.length);$('tracks').textContent=(confirmed.length+maybe.length)+'개';
+    if(confirmed.length&&$('vibrate').checked&&now-lastBuzz>3500){navigator.vibrate?.(45);lastBuzz=now;}
+    return {confirmed:confirmed.length,maybe:maybe.length};
+  }
+  function noNewFrame(now){
+    tracks=tracks.filter(p=>now-p.time<340);$('count').textContent='0';$('tracks').textContent=tracks.length+'개';
   }
   function draw(){
-    const d=overlay.width/(viewport.clientWidth||1);ctx.clearRect(0,0,overlay.width,overlay.height);
+    ctx.clearRect(0,0,overlay.width,overlay.height);
     if(!running||!video.videoWidth)return;
     const vw=viewport.clientWidth,vh=viewport.clientHeight,sourceRatio=video.videoWidth/video.videoHeight,viewRatio=vw/vh;
-    let dispW,dispH,offX,offY;
-    if(sourceRatio>viewRatio){dispH=vh;dispW=vh*sourceRatio;offX=(vw-dispW)/2;offY=0;}
-    else {dispW=vw;dispH=vw/sourceRatio;offX=0;offY=(vh-dispH)/2;}
-    const toScreen=p=>({x:(offX+(p.wx+cameraX)/width*dispW)*d,y:(offY+(p.wy+cameraY)/height*dispH)*d});
-    const now=performance.now();let drawn=0;const shown=[];
+    let dw,dh,ox,oy;
+    if(sourceRatio>viewRatio){dh=vh;dw=vh*sourceRatio;ox=(vw-dw)/2;oy=0;}
+    else {dw=vw;dh=vw/sourceRatio;ox=0;oy=(vh-dh)/2;}
+    const scale=overlay.width/(vw||1);
+    const toScreen=p=>({x:(ox+(p.wx+worldX)/width*dw)*scale,y:(oy+(p.wy+worldY)/height*dh)*scale});
+    const now=performance.now();let shown=0;
     for(const tr of tracks){
-      if(now-tr.last>450||tr.hits<3||tr.movement<7||drawn>=5)continue;
-      if(shown.some(p=>Math.hypot(p.x-tr.x,p.y-tr.y)<18))continue;
-      shown.push(tr);drawn++;
-      const strong=tr.hits>=4&&tr.movement>=12;
-      const at=toScreen(tr),color=strong?'#ff7569':'#ffdd86';
-      ctx.strokeStyle=color;ctx.lineWidth=(strong?2.8:1.7)*d;
-      ctx.beginPath();ctx.arc(at.x,at.y,Math.max(12*d,tr.size*dispW/width*d+4*d),0,Math.PI*2);ctx.stroke();
-      if(tr.path.length>=2){ctx.beginPath();tr.path.forEach((p,i)=>{const v=toScreen(p);if(i===0)ctx.moveTo(v.x,v.y);else ctx.lineTo(v.x,v.y);});ctx.lineWidth=1.5*d;ctx.stroke();}
+      if(now-tr.time>250||tr.hits<3||tr.total<7||shown>=5)continue;
+      shown++;const strong=tr.hits>=4&&tr.total>=10;
+      ctx.strokeStyle=strong?'#ff7569':'#ffdc7e';ctx.lineWidth=(strong?2.7:1.6)*scale;
+      const pos=toScreen(tr);ctx.beginPath();ctx.arc(pos.x,pos.y,Math.max(12*scale,tr.size*dw/width*scale+5*scale),0,Math.PI*2);ctx.stroke();
+      if(tr.path.length>1){ctx.beginPath();tr.path.forEach((p,i)=>{const v=toScreen(p);if(!i)ctx.moveTo(v.x,v.y);else ctx.lineTo(v.x,v.y);});ctx.lineWidth=1.2*scale;ctx.stroke();}
     }
   }
-  function analyze(t){
-    if(!running||processing||video.readyState<2||t-lastAnalysis<65)return;
-    lastAnalysis=t;processing=true;
+  function analyze(now){
+    if(!running||video.readyState<2||now-lastAnalysis<42)return;
+    lastAnalysis=now;
     try{
       wctx.drawImage(video,0,0,width,height);
-      const {data}=wctx.getImageData(0,0,width,height),curr=grayAndCoarse(data);
-      if(prev&&prevCoarse){
-        const coarse=estimateShift(prevCoarse,curr.coarse);
-        const shift=refineShift(prev,curr.gray,coarse.dx*5,coarse.dy*5);
-        const boundary=Math.abs(coarse.dx)>=9||Math.abs(coarse.dy)>=9;
-        const unreliable=!Number.isFinite(shift.score)||shift.score>29||coarse.score>41||boundary;
-        if(unreliable){
-          tracks=[];$('count').textContent='0';$('tracks').textContent='0개';
-          $('quality').textContent='흔들림/배경 변화';
-          msg('배경 정렬이 불안정해 잠시 탐지를 쉬고 있어요. 휴대폰을 조금 더 천천히 움직여 주세요.');
+      const frame=imageInfo(wctx.getImageData(0,0,width,height).data);
+      if(prev&&prevSmall){
+        const motion=estimateShift(prevSmall,frame.small,prev,frame.gray);
+        if(!motion.valid){
+          failed++;noNewFrame(now);$('quality').textContent='보정 중';
+          msg('카메라 움직임이 크거나 배경이 불안정해요. 잠시 천천히 비춰 보세요.');
+          if(failed>4){prev=null;prevSmall=null;failed=0;tracks=[];}
         }else{
-          cameraX+=shift.dx;cameraY+=shift.dy;
-          const {result,noise}=findBlobs(curr.gray,prev,shift.dx,shift.dy,Number($('sensitivity').value));
-          if(noise){tracks=[];$('count').textContent='0';$('tracks').textContent='0개';$('quality').textContent='변화 과다';msg('화면 변화가 너무 커요. 벽이나 천장을 향해 조금 천천히 움직여 보세요.');}
+          failed=0;worldX+=motion.dx;worldY+=motion.dy;
+          const result=findCandidates(frame.gray,prev,motion.dx,motion.dy,Number($('sensitivity').value));
+          if(result.noisy){noNewFrame(now);$('quality').textContent='변화 과다';msg('TV·천·그림자 등 큰 변화가 있어요. 모기 후보로 표시하지 않았어요.');}
           else{
-            const {confirmed,tentative}=linkTracks(result,t);
-            if(confirmed){$('quality').textContent='움직임 후보';msg('빨간 원은 배경과 다르게 움직인 후보입니다. 모기인지는 눈으로 확인하세요.');}
-            else if(tentative){$('quality').textContent='후보 확인 중';msg('작은 움직임을 추적하고 있어요. 잠시 같은 방향을 비춰 보세요.');}
-            else{$('quality').textContent='탐색 중';msg('후보 없음. 벽과 천장을 천천히 비춰 보세요.');}
+            const status=linkTracks(result.list,now);
+            if(status.confirmed){$('quality').textContent='움직임 후보';msg('빨간 원은 작은 움직임 후보입니다. 아직 모기 식별 AI는 없어요.');}
+            else if(status.maybe){$('quality').textContent='검증 중';msg('작은 움직임을 이어서 확인하고 있어요.');}
+            else{$('quality').textContent='탐색 중';msg('확인된 후보가 없어요. 벽·천장을 천천히 비춰 보세요.');}
           }
+          lastGood=now;
         }
       }
-      prev=curr.gray;prevCoarse=curr.coarse;
-      frameCount++;
-      if(t-fpsStart>=1100){$('fps').textContent=(frameCount*1000/(t-fpsStart)).toFixed(1)+' fps';fpsStart=t;frameCount=0;}
-    }catch(e){showError('영상 분석 오류: '+e.message);}finally{processing=false;}
+      prev=frame.gray;prevSmall=frame.small;samples++;
+      if(now-fpsStart>1100){$('fps').textContent=(samples*1000/(now-fpsStart)).toFixed(1)+' fps';samples=0;fpsStart=now;}
+    }catch(e){showError('분석 오류: '+e.message);}
   }
   function loop(t){if(!running)return;analyze(t);draw();requestAnimationFrame(loop);}
-  function showError(s){$('error').textContent=s;$('error').style.display='block';msg('오류가 발생했어요. 아래 내용을 확인하세요.');}
+  function showError(message){$('error').textContent=message;$('error').style.display='block';msg('오류가 발생했습니다. 아래 안내를 확인하세요.');}
   async function start(){
     if(running)return;$('error').style.display='none';
-    if(!navigator.mediaDevices?.getUserMedia){showError('카메라 API를 사용할 수 없습니다. HTTPS Replit 링크를 Chrome에서 여세요.');return;}
+    if(!navigator.mediaDevices?.getUserMedia){showError('카메라 권한을 사용할 수 없습니다. HTTPS 주소를 크롬에서 열어 주세요.');return;}
     try{
-      stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}}});
+      stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}}});
       video.srcObject=stream;await video.play();running=true;
-      $('start').disabled=true;$('stop').disabled=false;$('empty').style.display='none';$('mode').textContent='v0.2 수색 중';
-      configure();resizeOverlay();msg('처음 프레임을 확보하고 있어요. 휴대폰을 천천히 움직여 주세요.');requestAnimationFrame(loop);
+      $('start').disabled=true;$('stop').disabled=false;$('empty').style.display='none';$('mode').textContent='v0.3 수색 중';
+      configure();resizeOverlay();msg('모기 의심 물체를 찾고 있어요.');requestAnimationFrame(loop);
     }catch(e){showError('카메라 시작 실패 ('+e.name+'): '+e.message);}
   }
-  function stop(){
-    running=false;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  function stop(){running=false;if(stream){stream.getTracks().forEach(x=>x.stop());stream=null;}
     video.srcObject=null;ctx.clearRect(0,0,overlay.width,overlay.height);
     $('start').disabled=false;$('stop').disabled=true;$('empty').style.display='flex';$('mode').textContent='실험용 시제품';
-    $('quality').textContent='대기 중';msg('탐색이 종료되었습니다.');reset();
-  }
+    $('quality').textContent='대기 중';msg('탐색이 종료되었습니다.');reset();}
   $('start').addEventListener('click',start);$('stop').addEventListener('click',stop);
   $('clear').addEventListener('click',()=>{reset();msg('추적 기록을 초기화했습니다.');});
   $('resolution').addEventListener('change',()=>{if(running)configure();});
   $('sensitivity').addEventListener('change',()=>{tracks=[];});
   window.addEventListener('resize',resizeOverlay);window.addEventListener('pagehide',stop);resizeOverlay();
 })();
+
 </script>
 </body>
 </html>
